@@ -1,9 +1,10 @@
 """Extraction agent (06 §5, DECISIONS D2): page images → strict `ExtractionResult`.
 
 Modes of the returned outcome (stored in `invoices.extraction_mode`):
-* `live`      — gpt-4.1-mini vision via the Agents SDK, metered by the gateway.
-* `simulated` — the caller passed `fixture` (e.g. the corpus' `simulated_extraction` for replay docs).
-* `recorded`  — a recorded hero output from `tools/corpus/fixtures/heroes/<invoice>.json`.
+- `deterministic` — zero-cost intake from embedded or standalone EN 16931 XML (UBL/CII).
+- `live`          — gpt-4.1-mini vision via the Agents SDK, metered by the gateway.
+- `simulated`     — the caller passed `fixture` (e.g. the corpus' `simulated_extraction` for replay docs).
+- `recorded`      — a recorded hero output from `tools/corpus/fixtures/heroes/<invoice>.json`.
 
 Confidences returned here are the model's raw confidences; calibration (`app.domain.gate.
 calibrate_fallback`) and the gate are applied by the orchestrator.
@@ -22,6 +23,7 @@ from typing import Any
 
 from agents import Agent
 
+from .deterministic import extract_deterministic_invoice
 from .gateway import BudgetExceeded, LlmGateway, LlmUnavailable, get_gateway
 from .paths import PROMPTS_DIR, heroes_dir
 from .schemas import ExtractionResult, normalize_extraction
@@ -45,7 +47,7 @@ class ExtractionUnavailable(Exception):
 @dataclass(frozen=True)
 class ExtractionOutcome:
     result: ExtractionResult
-    mode: str  # live | recorded | simulated
+    mode: str  # deterministic | live | recorded | simulated
     model: str | None
     prompt_version: str
     cost_usd: Decimal
@@ -155,10 +157,25 @@ async def extract_document(
 ) -> ExtractionOutcome:
     """Extract one document.
 
-    Live when `LLM_MODE=live`, a key is available (owner or BYOK `api_key`) and the budget allows;
+    Deterministic when valid EN 16931 XML (standalone or embedded in hybrid PDF) is detected;
+    live when `LLM_MODE=live`, a key is available (owner or BYOK `api_key`) and the budget allows;
     otherwise falls back to `fixture` (→ mode `simulated`) or the recorded hero file (`hero`, → mode
     `recorded`). Raises `ExtractionUnavailable` when nothing is available, `BudgetExceeded` never
     escapes when a fallback exists. LLM/API errors propagate (the orchestrator retries)."""
+    # 0. Deterministic intake check (zero LLM cost, instant 1.0 confidence)
+    if pages:
+        deterministic_res = extract_deterministic_invoice(pages[0])
+        if deterministic_res is not None:
+            return ExtractionOutcome(
+                result=deterministic_res,
+                mode="deterministic",
+                model=None,
+                prompt_version="deterministic",
+                cost_usd=Decimal(0),
+                pages_sent=0,
+                fallback_reason=None,
+            )
+
     gw = gateway or get_gateway()
     reason: str | None = None
     if gw.can_call(api_key):
